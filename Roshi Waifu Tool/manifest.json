@@ -1,0 +1,15 @@
+{
+    "Name": "Roshi Waifu Tool RWT",
+    "Author": "MasterRoshiHehe",
+    "Version": "0.1.0",
+    "Description": "A workspace for testing Live Appearance Framework and Animated Portrait Framework content: pause, step and jump the day, restart the day, free camera, NPC inspector, and automatic 'patch reload' when a content pack's JSON changes.",
+    "UniqueID": "MasterRoshiHehe.RoshiWaifuTool",
+    "EntryDll": "RoshiWaifuTool.dll",
+    "MinimumApiVersion": "4.0.0",
+    "Dependencies": [
+        {
+            "UniqueID": "spacechase0.GenericModConfigMenu",
+            "IsRequired": false
+        }
+    ]
+}
