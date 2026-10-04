@@ -17,6 +17,8 @@ namespace RoshiWaifuTool.Framework
         private readonly Func<ModConfig> Config;
         private readonly CommandRunner Commands;
         private ILiveAppearanceApi Laf;
+        private ILiveAppearanceEditorApi LafEditor;
+        private IAnimatedPortraitApi Apf;
 
         public Inspector(IModHelper helper, IMonitor monitor, Func<ModConfig> config, CommandRunner commands)
         {
@@ -29,16 +31,83 @@ namespace RoshiWaifuTool.Framework
         /// <summary>Whether clicking an NPC inspects her (instead of talking to her).</summary>
         public bool Enabled { get; set; }
 
-        public void HookLiveAppearance()
+        /// <summary>Don't react to the cursor in the world right now (a ring is open on top of it).</summary>
+        public bool HoverBlocked { get; set; }
+
+        public bool HasLaf => this.Laf != null || this.LafEditor != null;
+        public bool HasApf => this.Apf != null;
+
+        /// <summary>LAF's "scan now" hook, if the installed LAF has the editor API.</summary>
+        public Action ScanNow => this.LafEditor != null ? this.LafEditor.ScanNow : null;
+
+        public void HookFrameworks()
         {
+            this.Laf = this.TryGetApi<ILiveAppearanceApi>("MasterRoshiHehe.LiveAppearanceFramework", "basic API");
+            this.LafEditor = this.TryGetApi<ILiveAppearanceEditorApi>("MasterRoshiHehe.LiveAppearanceFramework", "editor API");
+            this.Apf = this.TryGetApi<IAnimatedPortraitApi>("tyr4ntx.AnimatedPortraitFramework", "editor API");
+            this.Monitor.Log($"Frameworks: LAF {(this.Laf == null ? "not found" : this.LafEditor != null ? $"with editor API v{this.LafEditor.EditorApiVersion}" : "without editor API")}, APF {(this.Apf != null ? $"with editor API v{this.Apf.EditorApiVersion}" : "not found or without editor API")}.", LogLevel.Trace);
+        }
+
+        private T TryGetApi<T>(string modId, string what) where T : class
+        {
+            if (!this.Helper.ModRegistry.IsLoaded(modId))
+                return null;
+
             try
             {
-                this.Laf = this.Helper.ModRegistry.GetApi<ILiveAppearanceApi>("MasterRoshiHehe.LiveAppearanceFramework");
+                return this.Helper.ModRegistry.GetApi<T>(modId);
             }
             catch (Exception ex)
             {
-                this.Monitor.Log($"Couldn't read Live Appearance Framework's API: {ex.Message}", LogLevel.Trace);
+                // an older version of the framework without these members
+                this.Monitor.Log($"{modId} doesn't offer the {what} this tool expects ({ex.Message.Split('\n')[0]}).", LogLevel.Trace);
+                return null;
             }
+        }
+
+        /// <summary>Let the game (through LAF, if installed) pick an NPC's appearance again.</summary>
+        public void ChooseAppearance(NPC npc)
+        {
+            try
+            {
+                if (this.Laf != null)
+                    this.Laf.SafeChooseAppearance(npc);
+                else
+                    npc.ChooseAppearance();
+            }
+            catch (Exception ex)
+            {
+                this.Monitor.Log($"Couldn't re-pick {npc.Name}'s appearance: {ex.Message}", LogLevel.Trace);
+            }
+        }
+
+        /// <summary>APF's Explain tree for an NPC, or null if APF isn't there.</summary>
+        public ExplainNode GetApfTree(NPC npc)
+        {
+            return this.Apf != null ? ExplainNode.FromReply("APF", this.Apf.Explain(npc)) : null;
+        }
+
+        /// <summary>Everything known about an NPC as trees for the panel: basics, then each framework's Explain.</summary>
+        public List<ExplainNode> GetTrees(NPC npc)
+        {
+            var trees = new List<ExplainNode>();
+
+            var basics = new ExplainNode { Id = "Basics", Title = "Basics" };
+            var lines = new ExplainNode { Id = "lines", Title = "Sprite, portrait, next stop", Text = UiText.Clean(string.Join("\n", this.Describe(npc))) };
+            basics.Children.Add(lines);
+            trees.Add(basics);
+
+            if (this.LafEditor != null)
+                trees.Add(ExplainNode.FromReply("LAF", this.LafEditor.Explain(npc)));
+            else
+                trees.Add(new ExplainNode { Id = "LAF", Title = "LAF", Text = this.Laf != null ? "This LAF version has no editor API. Use the Console button for its reports." : "Live Appearance Framework isn't installed." });
+
+            if (this.Apf != null)
+                trees.Add(ExplainNode.FromReply("APF", this.Apf.Explain(npc)));
+            else
+                trees.Add(new ExplainNode { Id = "APF", Title = "APF", Text = "Animated Portrait Framework isn't installed, or this version has no editor API." });
+
+            return trees;
         }
 
         /// <summary>The NPC under the cursor in the current location, if any.</summary>
@@ -53,7 +122,7 @@ namespace RoshiWaifuTool.Framework
         }
 
         /// <summary>Run the configured diagnostics for an NPC; their output goes to the SMAPI console.</summary>
-        public void Inspect(NPC npc)
+        public void DumpToConsole(NPC npc)
         {
             this.Monitor.Log($"──────── {npc.Name} at {TimeMachine.Format(Game1.timeOfDay)} ────────", LogLevel.Info);
             foreach (string line in this.Describe(npc))
@@ -76,13 +145,17 @@ namespace RoshiWaifuTool.Framework
             if (Game1.currentLocation == null || Game1.eventUp)
                 return;
 
-            NPC hovered = this.Enabled ? this.GetHovered() : null;
+            NPC hovered = this.Enabled && !this.HoverBlocked ? this.GetHovered() : null;
 
-            if (this.Config().ShowLabels)
+            string mode = this.Config().Labels ?? "Show";
+            bool always = mode.Equals("Show", StringComparison.OrdinalIgnoreCase);
+            bool onHover = mode.Equals("Hover", StringComparison.OrdinalIgnoreCase);
+            if (always || onHover)
             {
+                NPC pointed = onHover && !this.HoverBlocked ? this.GetHovered() : null;
                 foreach (NPC npc in Game1.currentLocation.characters)
                 {
-                    if (npc.IsInvisible || !npc.IsVillager || npc == hovered)
+                    if (npc.IsInvisible || !npc.IsVillager || npc == hovered || (onHover && npc != pointed))
                         continue;
 
                     string label = this.GetAppearanceId(npc) ?? "(default)";
@@ -98,7 +171,7 @@ namespace RoshiWaifuTool.Framework
             {
                 Rectangle area = GetSpriteArea(hovered);
                 Vector2 position = Game1.GlobalToLocal(Game1.viewport, new Vector2(area.Right + 12, area.Top));
-                DrawBox(b, this.Describe(hovered).Append("click: full report in the console").ToArray(), position, centered: false, scale: 0.7f);
+                DrawBox(b, this.Describe(hovered).Append("click: open the inspector panel").ToArray(), position, centered: false, scale: 0.7f);
             }
         }
 
@@ -184,12 +257,13 @@ namespace RoshiWaifuTool.Framework
         internal static void DrawBox(SpriteBatch b, string[] lines, Vector2 position, bool centered, float scale)
         {
             SpriteFont font = Game1.smallFont;
+            lines = lines.Select(UiText.Clean).ToArray();
             float width = lines.Max(line => font.MeasureString(line).X) * scale;
             float lineHeight = font.LineSpacing * scale;
             if (centered)
                 position.X -= width / 2f;
 
-            b.Draw(Game1.staminaRect, new Rectangle((int)position.X - 6, (int)position.Y - 4, (int)width + 12, (int)(lineHeight * lines.Length) + 8), Color.Black * 0.75f);
+            b.Draw(Game1.staminaRect, new Rectangle((int)position.X - 6, (int)position.Y - 4, (int)width + 12, (int)(lineHeight * lines.Length) + 8), new Color(60, 35, 15) * 0.85f);
             for (int i = 0; i < lines.Length; i++)
                 b.DrawString(font, lines[i], new Vector2(position.X, position.Y + i * lineHeight), Color.White, 0f, Vector2.Zero, scale, SpriteEffects.None, 1f);
         }

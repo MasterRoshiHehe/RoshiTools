@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Microsoft.Xna.Framework;
 using StardewModdingAPI;
 using StardewValley;
+using StardewValley.Pathfinding;
 
 namespace RoshiWaifuTool.Framework
 {
@@ -10,10 +12,15 @@ namespace RoshiWaifuTool.Framework
     /// Moves the day forward. Verified against Stardew Valley 1.6.15:
     /// - Game1.performTenMinuteClockUpdate() is the real clock step (time +10, every location's performTenMinuteUpdate,
     ///   which calls NPC.checkSchedule for every visible NPC).
-    /// - NPC.warpToPathControllerDestination() (vanilla's "debug hurry") pops an NPC's schedule path down to its last two
-    ///   tiles, handling map warps, so she arrives and plays her end-of-route behaviour naturally.
-    /// - NPC.checkSchedule returns early while she still has a path, but queues the stop first; the queued legs are
-    ///   started in the settle phase.
+    /// - A walking NPC is teleported along her path the way NPC.warpToPathControllerDestination() (vanilla's "debug
+    ///   hurry") does it, map warps included, but all the way to the last tile. PathFindController.moveCharacter then
+    ///   sees her standing on it at her next update and finishes the walk normally (facing, end-of-route behaviour,
+    ///   end callback), so nothing is skipped except the walking itself.
+    /// - The same is done for NPC.temporaryController, which the game uses to walk an NPC back to her spot after a
+    ///   schedule animation and which LAF uses for detours. LAF keeps the controller object (it only checks the
+    ///   reference) and counts a detour's stay in game minutes, so detours play out during a jump.
+    /// - NPC.checkSchedule returns early while she still has a path, but queues the stop first; queued legs are started
+    ///   in the settle phase.
     /// There is no way back: schedules only move forward, so going back in time means restarting the day.
     /// </summary>
     internal sealed class TimeMachine
@@ -24,13 +31,24 @@ namespace RoshiWaifuTool.Framework
         /// <summary>How long the NPCs get to finish their queued schedule legs after a jump.</summary>
         private const int SettleTimeoutTicks = 20 * 60;
 
+        /// <summary>The settle phase ends when nobody's walk state changed for this long (an NPC held on purpose, e.g. by a detour stay).</summary>
+        private const int StallTicks = 90;
+
         private readonly IMonitor Monitor;
         private readonly Func<ModConfig> Config;
 
         private int Target = -1;
         private int TickCounter;
         private int SettleTicks = -1;
+        private string LastBusy;
+        private int UnchangedTicks;
         private Action OnDone;
+
+        /// <summary>
+        /// LAF's "scan now" hook, if available: called after every step so LAF checks detours, poses and rules for that
+        /// step right away instead of on its scan interval. Lets jumps run at <see cref="ModConfig.FastJumpStepTicks"/>.
+        /// </summary>
+        public Func<Action> GetScanNow { get; set; }
 
         public TimeMachine(IMonitor monitor, Func<ModConfig> config)
         {
@@ -74,6 +92,14 @@ namespace RoshiWaifuTool.Framework
 
             Game1.performTenMinuteClockUpdate();
             this.HurryAll();
+            try
+            {
+                this.GetScanNow?.Invoke()?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                this.Monitor.LogOnce($"LAF's scan hook failed: {ex.Message}", LogLevel.Trace);
+            }
             return true;
         }
 
@@ -110,7 +136,12 @@ namespace RoshiWaifuTool.Framework
         {
             if (this.Target >= 0)
             {
-                if (++this.TickCounter < Math.Max(1, this.Config().JumpTicksPerStep))
+                // every tick: walks can start between two steps (a queued leg, another mod's detour)
+                this.HurryAll();
+
+                // with the scan hook: LAF scans on the tick after a step and handles a clock change one tick later
+                int stepTicks = this.GetScanNow?.Invoke() != null ? Math.Max(3, this.Config().FastJumpStepTicks) : Math.Max(1, this.Config().JumpStepTicks);
+                if (++this.TickCounter < stepTicks)
                     return;
                 this.TickCounter = 0;
 
@@ -119,36 +150,49 @@ namespace RoshiWaifuTool.Framework
 
                 this.Target = -1;
                 this.SettleTicks = 0;
+                this.LastBusy = null;
+                this.UnchangedTicks = 0;
                 return;
             }
 
             if (this.SettleTicks >= 0)
             {
                 this.SettleTicks++;
-                if (this.SettleTicks % 5 == 0 && !this.Settle() || this.SettleTicks > SettleTimeoutTicks)
-                {
-                    if (this.SettleTicks > SettleTimeoutTicks)
-                        this.Monitor.Log($"Some NPCs were still on their way {SettleTimeoutTicks / 60} seconds after the jump to {Game1.timeOfDay}: {string.Join(", ", this.GetBusyNpcs().Select(npc => npc.Name))}.", LogLevel.Debug);
+                this.HurryAll();
+                if (this.SettleTicks % 5 == 0)
+                    this.StartQueuedLegs();
 
-                    this.SettleTicks = -1;
-                    Action done = this.OnDone;
-                    this.OnDone = null;
-                    done?.Invoke();
-                }
+                string busy = string.Join("; ", this.GetBusyNpcs().Select(Describe));
+                this.UnchangedTicks = busy == this.LastBusy ? this.UnchangedTicks + 1 : 0;
+                this.LastBusy = busy;
+
+                bool done = busy.Length == 0 && this.SettleTicks >= 5;
+                bool stalled = this.UnchangedTicks >= StallTicks;
+                bool timedOut = this.SettleTicks > SettleTimeoutTicks;
+                if (!done && !stalled && !timedOut)
+                    return;
+
+                if (!done)
+                    this.Monitor.Log($"Jump to {Game1.timeOfDay}: not everyone finished walking ({(stalled ? "nothing changed for a moment, e.g. a detour stay or a held leg" : $"still moving after {SettleTimeoutTicks / 60} s")}): {busy}", LogLevel.Info);
+
+                this.SettleTicks = -1;
+                Action onDone = this.OnDone;
+                this.OnDone = null;
+                onDone?.Invoke();
             }
         }
 
-        /// <summary>Move every NPC who is walking a schedule leg to the end of it.</summary>
+        /// <summary>Teleport every walking NPC to the last tile of her path.</summary>
         private void HurryAll()
         {
             foreach (NPC npc in this.GetScheduleNpcs())
             {
-                if (npc.controller?.pathToEndPoint == null || npc.controller.pathToEndPoint.Count <= 2)
-                    continue;
-
                 try
                 {
-                    npc.warpToPathControllerDestination();
+                    if (npc.controller != null)
+                        FinishWalk(npc, npc.controller);
+                    if (npc.temporaryController != null)
+                        FinishWalk(npc, npc.temporaryController);
                 }
                 catch (Exception ex)
                 {
@@ -157,31 +201,87 @@ namespace RoshiWaifuTool.Framework
             }
         }
 
-        /// <summary>Start queued legs and hurry walkers. Returns whether anyone is still busy.</summary>
-        private bool Settle()
+        /// <summary>
+        /// Move an NPC along a path until only its last tile is left, and stand her on it. Same steps as
+        /// NPC.warpToPathControllerDestination (pop, handleWarps, place, Halt), which stops two tiles early.
+        /// </summary>
+        private static void FinishWalk(NPC npc, PathFindController walk)
+        {
+            Stack<Point> path = walk.pathToEndPoint;
+            if (path == null || path.Count <= 1)
+                return;
+
+            // Still playing an animation (usually the outro of her schedule animation): wait for it. Her motion stays
+            // frozen until its last frame calls routeEndAnimationFinished, and Halt() below would cancel the animation
+            // (Sprite.StopAnimation clears it), leaving her frozen for the rest of the day.
+            if (npc.Sprite?.CurrentAnimation != null)
+                return;
+
+            int guard = 0;
+            while (path.Count > 1 && guard++ < 10000)
+            {
+                path.Pop();
+                Point tile = path.Peek();
+                walk.handleWarps(new Rectangle(tile.X * 64, tile.Y * 64, 64, 64)); // may warp her and pop more tiles
+                if (path.Count == 0)
+                    return;
+
+                tile = path.Peek();
+                npc.Position = new Vector2(tile.X * 64, tile.Y * 64 + 16);
+                npc.Halt();
+            }
+
+            if (path.Count == 1)
+            {
+                // 4 px above the tile's bottom edge: moveCharacter only counts her as arrived with a gap of 2+
+                Point last = path.Peek();
+                npc.Position = new Vector2(last.X * 64, last.Y * 64 + 12);
+            }
+        }
+
+        /// <summary>Start the schedule legs that queued up while NPCs were busy.</summary>
+        private void StartQueuedLegs()
         {
             foreach (NPC npc in this.GetScheduleNpcs())
             {
-                if (npc.controller == null && npc.temporaryController == null && npc.queuedSchedulePaths.Count > 0)
+                if (IsWalking(npc.controller) || IsWalking(npc.temporaryController) || npc.queuedSchedulePaths.Count == 0)
+                    continue;
+
+                try
                 {
-                    try
-                    {
-                        npc.checkSchedule(Game1.timeOfDay);
-                    }
-                    catch (Exception ex)
-                    {
-                        this.Monitor.LogOnce($"Couldn't start {npc.Name}'s queued schedule leg: {ex.Message}", LogLevel.Trace);
-                    }
+                    npc.checkSchedule(Game1.timeOfDay);
+                }
+                catch (Exception ex)
+                {
+                    this.Monitor.LogOnce($"Couldn't start {npc.Name}'s queued schedule leg: {ex.Message}", LogLevel.Trace);
                 }
             }
-
-            this.HurryAll();
-            return this.GetBusyNpcs().Any();
         }
 
         private IEnumerable<NPC> GetBusyNpcs()
         {
-            return this.GetScheduleNpcs().Where(npc => npc.controller != null || npc.queuedSchedulePaths.Count > 0);
+            // A controller with an empty path is normal for an NPC who arrived and plays her schedule animation: the
+            // game only clears it once her motion is unfrozen, and NPC.checkSchedule treats it as idle too.
+            return this.GetScheduleNpcs().Where(npc => IsWalking(npc.controller) || IsWalking(npc.temporaryController) || npc.queuedSchedulePaths.Count > 0);
+        }
+
+        private static bool IsWalking(PathFindController walk)
+        {
+            return walk?.pathToEndPoint != null && walk.pathToEndPoint.Count > 0;
+        }
+
+        private static string Describe(NPC npc)
+        {
+            var parts = new List<string>();
+            if (IsWalking(npc.controller))
+                parts.Add($"schedule walk, {npc.controller.pathToEndPoint.Count} tile(s) left");
+            if (IsWalking(npc.temporaryController))
+                parts.Add($"other walk, {npc.temporaryController.pathToEndPoint.Count} tile(s) left");
+            if (npc.queuedSchedulePaths.Count > 0)
+                parts.Add($"{npc.queuedSchedulePaths.Count} leg(s) waiting");
+            if (npc.Sprite?.CurrentAnimation != null)
+                parts.Add("animating");
+            return $"{npc.Name} in {npc.currentLocation?.NameOrUniqueName} {npc.TilePoint.X} {npc.TilePoint.Y} ({string.Join(", ", parts)})";
         }
 
         /// <summary>Every NPC with a schedule today, as a copy (hurrying can move NPCs between locations).</summary>

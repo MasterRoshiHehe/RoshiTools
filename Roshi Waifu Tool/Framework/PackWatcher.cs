@@ -54,6 +54,12 @@ namespace RoshiWaifuTool.Framework
             return this.Packs.Select(pack => $"{pack.Id} ({pack.Name}) — {pack.Folder}, {(pack.Files != null ? $"{pack.Files.Count} JSON file(s)" : "not scanned yet")}");
         }
 
+        /// <summary>The unique IDs of the watched packs.</summary>
+        public IEnumerable<string> GetPackIds()
+        {
+            return this.Packs.Select(pack => pack.Id);
+        }
+
         /// <summary>Find the packs to watch. Call once all mods are loaded, and again when the config changes.</summary>
         public void BuildWatchList()
         {

@@ -10,5 +10,6 @@ namespace RoshiWaifuTool.Framework
         bool IsInPose(NPC npc);
         string GetPoseId(NPC npc);
         string GetPoseStageId(NPC npc);
+        void SafeChooseAppearance(NPC npc);
     }
 }
